@@ -183,37 +183,127 @@ def fetch_stock(ticker, period="2y"):
             errors.append(str(e))
     raise ValueError(f"No data for {ticker}. Try: RELIANCE.NS, TCS.NS, HDFCBANK.NS")
 
-@st.cache_data(ttl=300, show_spinner=False)
 def fetch_info(ticker, df_raw=None):
-    """Fetch company info. Falls back to computing key metrics from price data."""
+    """
+    Fetch company info with maximum fallback coverage for Indian NSE/BSE stocks.
+    yfinance .info is unreliable for Indian markets, so we try every available
+    field and compute what is missing directly from price/financial data.
+    """
     result = {"name": ticker, "sector": "N/A", "industry": "N/A",
               "market_cap": None, "pe": None, "52w_high": None, "52w_low": None,
-              "description": "", "exchange": "NSE", "shares": None}
+              "description": "", "exchange": "NSE", "shares": None, "eps": None}
+
+    stock = yf.Ticker(ticker)
+
+    # ── Step 1: try .info (may be empty for Indian stocks) ───────────────────
     try:
-        i = yf.Ticker(ticker).info
+        i = stock.info
         result["name"]        = i.get("longName") or i.get("shortName") or ticker
         result["sector"]      = i.get("sector") or "N/A"
         result["industry"]    = i.get("industry") or "N/A"
         result["description"] = i.get("longBusinessSummary") or ""
         result["exchange"]    = i.get("exchange") or "NSE"
-        # These often return None for Indian stocks — we compute them from df if missing
-        result["market_cap"]  = i.get("marketCap")
-        result["pe"]          = i.get("trailingPE") or i.get("forwardPE")
-        result["52w_high"]    = i.get("fiftyTwoWeekHigh")
-        result["52w_low"]     = i.get("fiftyTwoWeekLow")
-        result["shares"]      = i.get("sharesOutstanding") or i.get("impliedSharesOutstanding")
+        # Try every known field name yfinance uses across versions
+        result["market_cap"] = (i.get("marketCap") or i.get("market_cap") or
+                                 i.get("enterpriseValue"))
+        result["pe"]         = (i.get("trailingPE") or i.get("forwardPE") or
+                                 i.get("trailingP/E") or i.get("priceToEarningsRatio"))
+        result["52w_high"]   = (i.get("fiftyTwoWeekHigh") or i.get("52WeekHigh") or
+                                 i.get("yearHigh"))
+        result["52w_low"]    = (i.get("fiftyTwoWeekLow") or i.get("52WeekLow") or
+                                 i.get("yearLow"))
+        result["shares"]     = (i.get("sharesOutstanding") or
+                                 i.get("impliedSharesOutstanding") or
+                                 i.get("floatShares"))
+        result["eps"]        = i.get("trailingEps") or i.get("forwardEps")
     except Exception:
         pass
-    # Always compute from price history — guaranteed to work
+
+    # ── Step 2: try fast_info — most reliable for Indian NSE/BSE stocks ───────
+    try:
+        fi = stock.fast_info
+        # fast_info attributes differ by yfinance version — try all known names
+        def _get(obj, *attrs):
+            for a in attrs:
+                try:
+                    v = getattr(obj, a, None)
+                    if v is not None and str(v) not in ("nan", "None", "0"):
+                        return float(v)
+                except: pass
+            return None
+
+        mc = _get(fi, "market_cap", "marketCap", "market_capitalization")
+        if mc and mc > 0: result["market_cap"] = mc
+
+        sh = _get(fi, "shares", "shares_outstanding", "sharesOutstanding")
+        if sh and sh > 0: result["shares"] = sh
+
+        yh = _get(fi, "year_high", "yearHigh", "fifty_two_week_high", "fiftyTwoWeekHigh")
+        if yh and yh > 0: result["52w_high"] = round(yh, 2)
+
+        yl = _get(fi, "year_low", "yearLow", "fifty_two_week_low", "fiftyTwoWeekLow")
+        if yl and yl > 0: result["52w_low"] = round(yl, 2)
+
+        # Also grab EPS from fast_info if available
+        eps = _get(fi, "trailing_eps", "trailingEps", "eps")
+        if eps: result["eps"] = eps
+
+    except Exception:
+        pass
+
+    # ── Step 3: compute from price history (always works) ───────────────────
     if df_raw is not None and not df_raw.empty:
+        cur_price = float(df_raw["Close"].iloc[-1])
+        # 52W from actual downloaded High/Low — 100% reliable
         one_year_ago = df_raw.index[-1] - pd.Timedelta(days=365)
         df_1y = df_raw[df_raw.index >= one_year_ago]
         if not df_1y.empty:
-            result["52w_high"] = result["52w_high"] or round(float(df_1y["High"].max()), 2)
-            result["52w_low"]  = result["52w_low"]  or round(float(df_1y["Low"].min()), 2)
-        # If shares outstanding available, compute market cap
+            result["52w_high"] = round(float(df_1y["High"].max()), 2)
+            result["52w_low"]  = round(float(df_1y["Low"].min()), 2)
+        # Market cap from shares × price
         if result["shares"] and result["market_cap"] is None:
+            result["market_cap"] = cur_price * float(result["shares"])
+        # P/E from EPS if available
+        if result["pe"] is None and result["eps"] and float(result["eps"]) > 0:
+            result["pe"] = round(cur_price / float(result["eps"]), 2)
+
+    # ── Step 4: financials fallback for PE ───────────────────────────────────
+    if result["pe"] is None and df_raw is not None:
+        try:
+            # Try income_stmt first (newer yfinance), then financials
+            for fin_source in ["income_stmt", "financials"]:
+                try:
+                    fin = getattr(stock, fin_source)
+                    if fin is None or fin.empty:
+                        continue
+                    ni_labels = ["Net Income", "NetIncome", "net income",
+                                 "Net Income From Continuing Operations"]
+                    ni_row = next((r for r in fin.index
+                                   if any(l.lower() in str(r).lower() for l in ni_labels)), None)
+                    if ni_row is not None and result["shares"]:
+                        ni = float(fin.loc[ni_row].iloc[0])
+                        if ni > 0:
+                            cur_price = float(df_raw["Close"].iloc[-1])
+                            eps_est = ni / float(result["shares"])
+                            if eps_est > 0:
+                                result["pe"] = round(cur_price / eps_est, 2)
+                                break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # ── Step 5: market cap from shares if still missing ──────────────────────
+    if result["market_cap"] is None and result["shares"] and df_raw is not None:
+        try:
             result["market_cap"] = float(df_raw["Close"].iloc[-1]) * float(result["shares"])
+        except Exception:
+            pass
+
+    # Round market cap
+    if result["market_cap"]:
+        result["market_cap"] = float(result["market_cap"])
+
     return result
 
 def add_features(df):
@@ -530,7 +620,14 @@ if "Overview" in page:
     k1,k2,k3,k4,k5,k6=st.columns(6)
     k1.metric("Price",fmt_inr(cn)); k2.metric("Day Change",f"{dc:+.2f}%")
     k3.metric("52W High",fmt_inr(info.get("52w_high"))); k4.metric("52W Low",fmt_inr(info.get("52w_low")))
-    k5.metric("Market Cap",fmt_mcap(info.get("market_cap"))); k6.metric("P/E",f"{info['pe']:.1f}" if info.get("pe") else "N/A")
+    # Market cap display
+    mc_val = info.get("market_cap")
+    mc_display = fmt_mcap(mc_val) if mc_val else "N/A"
+    # P/E display
+    pe_val = info.get("pe")
+    pe_display = f"{float(pe_val):.1f}x" if pe_val and str(pe_val) not in ["None","nan","inf"] else "N/A"
+    k5.metric("Market Cap", mc_display)
+    k6.metric("P/E Ratio", pe_display)
     st.markdown("<br>",unsafe_allow_html=True)
     sa,sb,sc,sd=st.columns([1,1,1,2])
     sa.markdown(f"<div class='sig-{sig['signal'].lower()}'>{sig['signal']}</div>",unsafe_allow_html=True)
