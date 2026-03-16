@@ -183,18 +183,24 @@ def investment_signal(df: pd.DataFrame, ens_price: float) -> dict:
 # ═══════════════════════════════════════════════════════════
 #  CHART HELPERS
 # ═══════════════════════════════════════════════════════════
+_AXIS = dict(showgrid=True,gridcolor=PAL["border"],gridwidth=0.5,zeroline=False,tickfont=dict(size=10))
+
 def _layout(**kw):
-    return dict(
+    base = dict(
         paper_bgcolor=PAL["bg2"], plot_bgcolor=PAL["bg"],
         font=dict(family="monospace", color=PAL["text2"], size=11),
-        xaxis=dict(showgrid=True,gridcolor=PAL["border"],gridwidth=0.5,zeroline=False,tickfont=dict(size=10)),
-        yaxis=dict(showgrid=True,gridcolor=PAL["border"],gridwidth=0.5,zeroline=False,tickfont=dict(size=10)),
         margin=dict(l=48,r=20,t=36,b=36),
         legend=dict(bgcolor="rgba(0,0,0,0)",borderwidth=0,font=dict(size=10,color=PAL["text2"])),
         hovermode="x unified",
         hoverlabel=dict(bgcolor=PAL["bg2"],bordercolor=PAL["border"],font=dict(size=11,color=PAL["text"])),
-        **kw,
     )
+    # merge axis defaults with any overrides passed in kw
+    xaxis_kw = kw.pop("xaxis", {})
+    yaxis_kw = kw.pop("yaxis", {})
+    base["xaxis"] = {**_AXIS, **xaxis_kw}
+    base["yaxis"] = {**_AXIS, **yaxis_kw}
+    base.update(kw)
+    return base
 
 CFG = {"displayModeBar": False}
 
