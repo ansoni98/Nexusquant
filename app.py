@@ -184,15 +184,37 @@ def fetch_stock(ticker, period="2y"):
     raise ValueError(f"No data for {ticker}. Try: RELIANCE.NS, TCS.NS, HDFCBANK.NS")
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_info(ticker):
+def fetch_info(ticker, df_raw=None):
+    """Fetch company info. Falls back to computing key metrics from price data."""
+    result = {"name": ticker, "sector": "N/A", "industry": "N/A",
+              "market_cap": None, "pe": None, "52w_high": None, "52w_low": None,
+              "description": "", "exchange": "NSE", "shares": None}
     try:
         i = yf.Ticker(ticker).info
-        return {"name":i.get("longName",ticker),"sector":i.get("sector","N/A"),
-                "industry":i.get("industry","N/A"),"market_cap":i.get("marketCap"),
-                "pe":i.get("trailingPE"),"52w_high":i.get("fiftyTwoWeekHigh"),
-                "52w_low":i.get("fiftyTwoWeekLow"),"description":i.get("longBusinessSummary",""),
-                "exchange":i.get("exchange","NSE")}
-    except: return {"name":ticker,"exchange":"NSE"}
+        result["name"]        = i.get("longName") or i.get("shortName") or ticker
+        result["sector"]      = i.get("sector") or "N/A"
+        result["industry"]    = i.get("industry") or "N/A"
+        result["description"] = i.get("longBusinessSummary") or ""
+        result["exchange"]    = i.get("exchange") or "NSE"
+        # These often return None for Indian stocks — we compute them from df if missing
+        result["market_cap"]  = i.get("marketCap")
+        result["pe"]          = i.get("trailingPE") or i.get("forwardPE")
+        result["52w_high"]    = i.get("fiftyTwoWeekHigh")
+        result["52w_low"]     = i.get("fiftyTwoWeekLow")
+        result["shares"]      = i.get("sharesOutstanding") or i.get("impliedSharesOutstanding")
+    except Exception:
+        pass
+    # Always compute from price history — guaranteed to work
+    if df_raw is not None and not df_raw.empty:
+        one_year_ago = df_raw.index[-1] - pd.Timedelta(days=365)
+        df_1y = df_raw[df_raw.index >= one_year_ago]
+        if not df_1y.empty:
+            result["52w_high"] = result["52w_high"] or round(float(df_1y["High"].max()), 2)
+            result["52w_low"]  = result["52w_low"]  or round(float(df_1y["Low"].min()), 2)
+        # If shares outstanding available, compute market cap
+        if result["shares"] and result["market_cap"] is None:
+            result["market_cap"] = float(df_raw["Close"].iloc[-1]) * float(result["shares"])
+    return result
 
 def add_features(df):
     df=df.copy()
@@ -446,23 +468,11 @@ with st.sidebar:
     st.divider()
     st.markdown("**Navigate**")
     page=st.radio("",["Home  Overview","Chart  ML Models","Tech  Technical","AI  Predictions","Risk  Volatility","Money  Portfolio"],label_visibility="collapsed")
-    st.divider()
-    st.markdown("<p style='font-size:11px;color:#4a5a70;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px'>Quick Pick</p>",unsafe_allow_html=True)
-    QUICK=[("Reliance","Reliance"),("TCS","TCS"),("Infosys","Infosys"),("HDFC Bank","HDFC Bank"),("ICICI Bank","ICICI Bank"),("Tata Motors","Tata Motors"),("Zomato","Zomato"),("Wipro","Wipro")]
-    cc=st.columns(2)
-    for i,(label,name) in enumerate(QUICK):
-        if cc[i%2].button(label,key=f"qp_{i}",use_container_width=True):
-            st.session_state["company_search"]=name
-            st.session_state["_auto"]=True
-            st.rerun()
     st.markdown("<div style='display:flex;align-items:center;gap:8px;margin-top:16px'><span style='width:7px;height:7px;border-radius:50%;background:#5CF5A0;box-shadow:0 0 8px #5CF5A0;display:inline-block'></span><span style='font-size:11px;color:#8496AE;font-family:JetBrains Mono,monospace'>NSE/BSE Live Data</span></div>",unsafe_allow_html=True)
 
 # SESSION STATE
 if "data" not in st.session_state: st.session_state["data"]=None
-if st.session_state.get("_auto"):
-    del st.session_state["_auto"]
-    analyze_btn=True
-    company_input=st.session_state.get("company_search","")
+# (quick pick removed)
 
 # LOAD DATA
 if analyze_btn and company_input.strip():
@@ -471,7 +481,7 @@ if analyze_btn and company_input.strip():
             ticker=resolve_ticker(company_input)
             df_raw=fetch_stock(ticker,period)
             df=add_features(df_raw)
-            info=fetch_info(ticker)
+            info=fetch_info(ticker, df_raw=df_raw)
             models=build_models(df)
             tech=technical_indicators(df)
             fc=ensemble_forecast(models,df)
